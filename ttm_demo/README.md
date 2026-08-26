@@ -1,113 +1,126 @@
-# TTM 使用过程 Demo
+# TTM + GEM 教学 Demo
 
-本模块不接 GPU。它搭一个假的 TTM 设备：`SYSTEM` 无限、`VRAM` 只有 16KB，
-用来走一遍 amdgpu 里 BO 的核心调用链。
+本模块演示 **TTM 如何管理 Buffer Object (BO) 在 SYSTEM 与 VRAM 之间的 placement**。
+不接真实 GPU，用 16KB 假 VRAM 把 eviction / move / fence 行为放大到可观察。
 
-和 `dma_resv_demo` 的关系：`dma_resv` 是每块 buffer 的依赖登记表；
-TTM 在 **validate / move / destroy** 前会查这张表，没做完就等待或返回 `-EBUSY`。
-
-## 1. TTM 在驱动里是哪一层
+## 核心概念：三层结构
 
 ```text
-用户 / KFD / GEM ioctl
-        │
-        ▼
-  amdgpu_bo_create / amdgpu_bo_validate / pin
-        │
-        ▼
-  ttm_bo_init_reserved / ttm_bo_validate     ← 本 demo 直接调用
-        │
-        ├─ resource manager  记账：这块放哪、偏移多少
-        │     SYSTEM  : 无限，ttm_sys_man（ttm_device_init 自带）
-        │     VRAM    : 有限区间，ttm_range_man / amdgpu VRAM manager
-        │     TT/GTT  : 系统页 + GPU 可访问映射（本 demo 未启用）
-        │
-        ├─ ttm_tt            真正的系统页 backing
-        │
-        └─ funcs->move       域之间搬数据
-              真 GPU : SDMA blit
-              本 demo: ttm_bo_move_null() 只换标签
+┌─────────────────────────────────────────────────────────────┐
+│  GEM (drm_gem_object)                                       │
+│    size, dma_resv, handle — 用户态看到的“buffer 对象”      │
+├─────────────────────────────────────────────────────────────┤
+│  TTM (ttm_buffer_object)                                  │
+│    mem (placement) — 这块 buffer 放在哪个域、偏移多少       │
+│    ttm_tt            — 系统 RAM 页 backing（真正存数据）     │
+├─────────────────────────────────────────────────────────────┤
+│  Resource Manager                                           │
+│    SYSTEM : 无限（ttm_sys_man，device_init 自带）           │
+│    VRAM   : 有限（本 demo 仅 4 页 = 16KB）                  │
+│    TT/GTT : 系统页 + GPU 映射（本 demo 未启用）             │
+└─────────────────────────────────────────────────────────────┘
 ```
 
-## 2. 一次 BO 生命的调用顺序
+### SYSTEM vs VRAM：数据在哪？
+
+| 域 | 本 demo | 真实 amdgpu |
+|---|---|---|
+| **SYSTEM** | 只记账；数据在 `ttm_tt` 系统页 | 同上，或 swap 到 shmem |
+| **VRAM** | 只改 `mem.mem_type` 标签；数据仍在系统页 | SDMA 把页搬到 GPU 显存 |
+| **backing** | `ttm_tt->pages[]` 始终是系统 RAM | VRAM 域也有 `ttm_tt` 做中转 |
+
+关键：**placement（放哪）和 backing（数据在哪）是分开的**。  
+本 demo 的 `move()` 调用 `ttm_bo_move_null()`，只换标签不搬数据；amdgpu 会用 SDMA blit。
+
+### GEM 与 TTM 的关系
 
 ```text
-drm_gem_private_object_init()     填 size，挂上 dma_resv
+用户 ioctl (GEM_CREATE / GEM_CLOSE)
         │
-ttm_bo_init_reserved()            内部立刻 ttm_bo_validate()
+        ▼
+drm_gem_private_object_init()   ← 设置 size、挂 dma_resv
         │
-        ├─ ttm_resource_alloc()   向目标 domain 要一段空间
-        │       不够 → LRU eviction → 再试
+        ▼
+ttm_bo_init_reserved()          ← 立刻 validate 到目标 placement
         │
-        ├─ funcs->move()          NONE/SYSTEM → VRAM
-        │       1. ttm_bo_wait_ctx()   等 dma_resv（驱动自己写，核心不代劳）
-        │       2. 真 GPU: SDMA blit；本 demo: ttm_bo_move_null()
-
-
-之后要换地方：reserve → ttm_bo_validate(新 placement) → unreserve
-销毁：ttm_bo_put() → 等 fence idle → 释放 resource / ttm → destroy()
+        ├─ resource manager 分配 mem.start / mem.mem_type
+        ├─ funcs->move()     域切换（等 fence → 搬数据或换标签）
+        └─ ttm_tt_populate() CPU 访问时填充系统页
 ```
 
-## 3. 本 demo 跑出来的场景
-
-假 VRAM = 4 页 = 16KB。`ttm_range_manager` 分配的是**连续**页，所以空闲总量够也不一定放得下。
+## 一次 BO 生命周期
 
 ```text
-[1] 创建 A=4KB @ SYSTEM，CPU 写入 magic=0xDEADBEEF
-      ttm_tt 此时才 populate（kmap 触发）
+create:  ttm_bo_init_reserved(pl=SYSTEM/VRAM)
+           └─ 内部 ttm_bo_validate → alloc + move
 
-[2] 给 A 的 dma_resv 挂一个未完成 KERNEL fence
-      validate(VRAM, no_wait_gpu=1) → -EBUSY
-        真正挡住搬移的是 driver move() 里的 ttm_bo_wait_ctx()
-        TTM 核心不会在 validate 入口自动等这块 BO 的 fence
-      signal 后再 validate(TOPDOWN) → A 进入 VRAM start=3（顶部）
+validate: ttm_bo_validate(pl=新域)
+           └─ 空间不够 → LRU eviction → evict_flags → move
 
-[3] 创建 B=8KB @ VRAM（从底部）
-      布局: [ B 8KB ][ 空 4KB ][ A 4KB ]
-      usage = 12KB
+destroy: ttm_bo_put()
+           └─ 等 dma_resv idle → free resource → destroy ttm_tt
+```
 
-[4] 创建 C=8KB @ VRAM
-      连续空闲不够 → eviction A (VRAM→SYSTEM)
+## Demo 场景（dmesg 里 [1]–[5]）
+
+假 VRAM = 4 页 = 16KB。`ttm_range_manager` 分配**连续**页，总量够也可能放不下。
+
+```text
+[1] A=4KB @ SYSTEM，CPU 写 magic → ttm_tt populate
+
+[2] A 挂未完成 fence → validate(VRAM) + no_wait → -EBUSY
+      signal 后成功 → A @ VRAM start=3 (TOPDOWN)
+
+[3] B=8KB @ VRAM  →  [ B 8KB ][ 空 4KB ][ A 4KB ]
+
+[4] C=8KB @ VRAM  →  eviction A→SYSTEM，magic 仍在
       布局: [ B 8KB ][ C 8KB ]
-      再读 A[0]，magic 仍在：move_null 只改 placement，页没拷贝
 
-[5] pin B 后创建 D=8KB
-      只能 eviction 未 pin 的 C；B 留在 VRAM
+[5] B 设 NO_EVICT → 创建 D=8KB → 只能踢 C
       布局: [ B 8KB ][ D 8KB ]
 ```
 
-```text
-时间轴上的 VRAM（每格 4KB）:
+## 与 amdgpu 对照
 
-[1]  ____ ____ ____ ____
-[2]  ____ ____ ____ [A ]
-[3]  [  B   ]  ____ [A ]
-[4]  [  B   ]  [  C   ]      A 被挤到 SYSTEM
-[5]  [  B   ]  [  D   ]      C 被挤走，B 因 pin 不动
-```
-
-## 4. 和 amdgpu 的对应关系
-
-| Demo | amdgpu |
+| 本 demo | amdgpu (`amdgpu_ttm.c`) |
 |---|---|
-| `ttm_device_init` | `amdgpu_ttm.c` 里 `ttm_device_init(&adev->mman.bdev, ...)` |
-| `ttm_range_man_init(VRAM)` | VRAM / GDS / doorbell 等有限域 |
-| `funcs->move` = `wait_ctx` + `move_null` | `amdgpu_bo_move()` → `ttm_bo_wait_ctx` + SDMA `COPY_LINEAR` |
-| `evict_flags` → SYSTEM | `amdgpu_evict_flags()` → GTT，再 SYSTEM |
-| `bo->base.resv` | 同一块 `dma_resv`，CS / move / CPU 访问都等它 |
-| `ttm_bo_pin` | `amdgpu_bo_pin`，scanout / fb / kernel BO 常用 |
+| `ttm_bo_device_init` | `ttm_bo_device_init(&adev->mman.bdev, ...)` |
+| `ttm_range_man_init(VRAM)` | VRAM/GDS/doorbell manager |
+| `move` = wait + `move_null` | `amdgpu_bo_move` = wait + SDMA |
+| `evict_flags` → SYSTEM | `amdgpu_evict_flags` → GTT → SYSTEM |
+| `TTM_PL_FLAG_NO_EVICT` | pin / 内核 BO 防 eviction |
+| `bo->base.resv` | CS / move / CPU 共用同一张 fence 表 |
 
-TTM 管的是 **placement（这块内存在哪个域、偏移多少）**。
-GPU 虚拟地址（GPUVM page table）是更上面一层，本 demo 不涉及。
+TTM 管 **placement**；GPU 虚拟地址（GPUVM）是更上层，本 demo 不涉及。
 
-## 5. 编译与运行
+## 为什么不用真实 VRAM？
 
-需要能加载 `ttm.ko` 的内核（本机 `6.8` 即可），不需要 AMD GPU。
+1. 本机 amdgpu 已占用所有 GPU VRAM 和 DRM minor 号
+2. 假 VRAM 能可控地触发 eviction，便于学习
+3. 观察真实 VRAM 请用：`cat /sys/class/drm/card*/device/mem_info_vram_*`
+
+## 编译与运行
+
+内核 5.10+（本机 `5.10.134` 已验证）：
 
 ```bash
 cd linux_gpu_driver_demos/ttm_demo
 make
-make run
+sudo modprobe ttm
+sudo dmesg -C
+sudo insmod ttm_demo.ko
+sudo rmmod ttm_demo
+dmesg | rg ttm_demo
 ```
 
-`dmesg` 里按 `[1]`…`[5]` 看每一步的 `mem=`、`move ... evict=` 和 `VRAM usage=`。
+或：`make run`
+
+## 建议配合阅读的内核头文件
+
+```text
+include/drm/ttm/ttm_bo_api.h      — BO 生命周期 API
+include/drm/ttm/ttm_bo_driver.h   — driver 回调、ttm_bo_device
+include/drm/ttm/ttm_placement.h   — TTM_PL_* 域定义
+include/drm/ttm/ttm_tt.h          — 系统页 backing
+include/drm/drm_gem.h             — GEM 对象
+```
