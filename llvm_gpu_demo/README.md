@@ -109,3 +109,174 @@ s_endpgm                          ; wavefront 结束
 - `host.cpp` — code object 加载与 launch
 - `build/vec_add.s` — 对照 ISA
 - `build/vec_add.disasm.txt` — 机器码十六进制
+
+## 如何 debug 执行过程
+
+可以按 **编译链 → host 执行 → GPU kernel** 三层排查。
+
+### 1. 编译链：确认每一步产物
+
+不需要 GPU，先检查中间文件：
+
+```bash
+make clean && make ir asm obj co disasm
+make show
+```
+
+| 怀疑点 | 查看文件 |
+|---|---|
+| 前端 / IR 不对 | `build/vec_add.ll` — 是否有 `llvm.amdgcn.workitem.id.x` |
+| 优化改坏了 | `diff build/vec_add.ll build/vec_add.opt.ll` |
+| ISA 不符合预期 | `build/vec_add.s` — `s_load` / `global_load` / `v_add_f32` |
+| 机器码 | `build/vec_add.disasm.txt` |
+| code object 结构 | `llvm-readobj -h build/vec_add.co` |
+
+```bash
+/opt/rocm/llvm/bin/llvm-objdump -d build/vec_add.co
+/opt/rocm/llvm/bin/llvm-readobj --symbols build/vec_add.co | rg vec_add
+```
+
+确认符号 `vec_add` 存在，否则 `hipModuleGetFunction` 会失败。
+
+### 2. Host 端：debug `run_vec_add`
+
+#### 环境变量
+
+```bash
+export LD_LIBRARY_PATH=/opt/rocm/lib:$LD_LIBRARY_PATH
+export HIP_VISIBLE_DEVICES=0
+
+export HIP_LAUNCH_BLOCKING=1    # 同步 launch，便于定位 hang
+export HSA_ENABLE_DEBUG=1
+export HSA_DEBUG=1
+```
+
+#### GDB 调试 host
+
+```bash
+make host
+gdb --args ./build/run_vec_add build/vec_add.co
+```
+
+常用断点：
+
+```text
+break hipModuleLoadData
+break hipModuleGetFunction
+break hipModuleLaunchKernel
+break hipMemcpy
+run
+```
+
+重点检查：
+
+- `blob.size()` 是否大于 0
+- `hipModuleGetFunction(..., "vec_add")` 是否返回 `hipSuccess`
+- `da` / `db` / `dc` / `n` 和 `args[]` 里的地址是否正确
+
+#### 在 host 里加打印（最快）
+
+在 `host.cpp` 关键步骤后加：
+
+```cpp
+std::cerr << "mod loaded, launching n=" << n << "\n";
+std::cerr << "da=" << da << " db=" << db << " dc=" << dc << "\n";
+```
+
+launch 后打印 `hc[]`，期望 `{11, 22, 33, 44}`。
+
+### 3. GPU kernel：debug 设备端
+
+#### rocgdb
+
+本机工具：`/opt/rocm/bin/rocgdb`
+
+```bash
+export LD_LIBRARY_PATH=/opt/rocm/lib:$LD_LIBRARY_PATH
+rocgdb --args ./build/run_vec_add build/vec_add.co
+```
+
+```text
+break vec_add
+run
+info registers
+```
+
+如需更好体验，可在编译时加 debug info：
+
+```bash
+make clean
+make obj co host CLANG_GPU_FLAGS='--target=amdgcn-amd-amdhsa -mcpu=gfx942 -O2 -x c -g'
+```
+
+#### kernel 里 printf
+
+在 `kernel.c` 加：
+
+```c
+if (i == 0)
+    printf("vec_add: n=%d a=%p b=%p c=%p\n", n, a, b, c);
+```
+
+重新 `make co` 再运行，可确认 kernarg 是否传对。
+
+### 4. 对照汇编理解 launch
+
+`host.cpp` 的 launch 参数：
+
+```text
+grid  = (1, 1, 1)    → 1 个 work-group
+block = (n, 1, 1)    → n 个 work-item（n=4 时 4 个 lane 工作）
+```
+
+对照 `build/vec_add.s` 的执行路径：
+
+```text
+s_load_dword s2, ...       ← 从 kernarg 读 n
+v_cmp_gt_i32 vcc, s2, v0   ← v0 = workitem.id.x，边界检查
+global_load_dword ...      ← 读 a[i], b[i]
+v_add_f32 ...              ← 加
+global_store_dword ...     ← 写 c[i]
+s_endpgm                   ← wave 结束
+```
+
+若结果不对，按顺序查：
+
+1. kernarg（`s_load` 读到的指针和 `n`）
+2. 边界检查（是否越界）
+3. 设备内存（`hipMemcpy` 是否成功）
+
+### 5. 常见问题
+
+| 现象 | 可能原因 | 怎么查 |
+|---|---|---|
+| `hipModuleLoadData` 失败 | `.co` 损坏或架构不匹配 | `file build/vec_add.co`，确认 target 是 `gfx942` |
+| `hipModuleGetFunction` 失败 | 符号名不对 | `llvm-readobj --symbols build/vec_add.co` |
+| `no ROCm-capable device` | 驱动 / GPU 未就绪 | `rocminfo` / `hipinfo` |
+| 结果全 0 | launch 未完成就读回 | 确认有 `hipDeviceSynchronize()` |
+| 结果不对 | `args[]` 传参错误 | GDB 看是否为 `&da,&db,&dc,&n` |
+| hang | GPU 队列卡住 | `HIP_LAUNCH_BLOCKING=1` + `dmesg` |
+
+### 6. 推荐 debug 顺序
+
+```text
+1. make disasm              确认 ISA 合理
+2. make host                确认 host 能编译
+3. ./build/run_vec_add build/vec_add.co
+4. 不对 → GDB 断在 hipModuleLaunchKernel
+5. 仍不对 → kernel printf 或 rocgdb 断在 vec_add
+6. 对照 vec_add.s 逐步理解 s_load / global_load 行为
+```
+
+### 7. CLR / ROCr runtime 层 debug
+
+本 demo 只覆盖 **HIP API → kernel 执行** 的最小路径。若问题出在 **stream/queue/AQL/signal 调度**（例如 queue idle hang、`hsa_signal_wait` 阻塞），需要 debug CLR（libamdhip64）和 ROCr（libhsa-runtime64）运行时：
+
+→ 完整指南：[rocm-system-pyuan/DEBUG_CLR_ROCR.md](../../rocm-system-pyuan/DEBUG_CLR_ROCR.md)
+
+要点：
+
+- 用 `build_rocm.sh` 构建带符号的 `dist/libamdhip64.so.7` + `libhsa-runtime64.so.1.*`
+- `AMD_LOG_LEVEL` / `AMD_LOG_MASK` 跟踪 AQL/queue/signal
+- `rocgdb -p <pid>` 断在 `VirtualGPU::IsQueueIdle`、`InterceptQueue::Submit`
+- hang 时用 `debug_scripts/06_collect_all_gpu_debug.sh --pid <pid>` 采集现场

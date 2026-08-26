@@ -28,6 +28,11 @@ sudo rmmod ttm_demo dma_resv_demo
 2. `ttm_demo` — 理解 TTM 如何在 SYSTEM 与 VRAM 之间管理 BO
 3. `llvm_gpu_demo` — 理解 kernel 如何从 LLVM IR 变成 GCN ISA 和 code object
 
+## 相关文档
+
+- [CLR + ROCr Runtime Debug 指南](../rocm-system-pyuan/DEBUG_CLR_ROCR.md) — stream/queue/AQL/signal 层 debug
+- [ROCm Forensics Toolkit](../debug_scripts/README_CN.md) — hang 现场采集工具
+
 ## LLVM GPU demo（不涉及 insmod）
 
 ```bash
