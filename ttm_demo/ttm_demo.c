@@ -5,12 +5,15 @@
  *   创建设备 → 分配 BO → validate/move → 空间不够 eviction → pin 免疫 → dma_resv 卡住搬移
  *
  * 对照真实 amdgpu：
- *   ttm_bo_device_init       ↔ amdgpu_ttm.c
+ *   ttm_device_init          ↔ amdgpu_ttm.c
  *   ttm_range_man_init(VRAM) ↔ VRAM manager
  *   ttm_bo_init_reserved     ↔ amdgpu_bo_create()
  *   ttm_bo_validate          ↔ amdgpu_bo_pin / CS 前 validate
  *   funcs->move              ↔ amdgpu_bo_move() → SDMA blit
  * 本 demo 的 move 只改 placement 标签，数据始终在 ttm_tt 的系统页上。
+ *
+ * 针对 6.8 内核：TTM 公共头是 ttm_bo.h / ttm_device.h，
+ * 没有旧的 ttm_bo_api.h / ttm_bo_driver.h。
  */
 #define pr_fmt(fmt) "ttm_demo: " fmt
 
@@ -26,9 +29,10 @@
 #include <drm/drm_drv.h>
 #include <drm/drm_gem.h>
 #include <drm/drm_vma_manager.h>
-#include <drm/ttm/ttm_bo_api.h>
-#include <drm/ttm/ttm_bo_driver.h>
+#include <drm/ttm/ttm_bo.h>
+#include <drm/ttm/ttm_device.h>
 #include <drm/ttm/ttm_placement.h>
+#include <drm/ttm/ttm_range_manager.h>
 #include <drm/ttm/ttm_tt.h>
 #include <drm/ttm/ttm_resource.h>
 
@@ -44,7 +48,7 @@ static struct platform_device *demo_pdev;
 static struct file *demo_anon_file;
 static struct drm_device demo_drm;
 static struct drm_vma_offset_manager demo_vma_mgr;
-static struct ttm_bo_device demo_bdev;
+static struct ttm_device demo_bdev;
 static bool demo_ttm_ok;
 static bool demo_vram_ok;
 static bool demo_drm_ok;
@@ -62,11 +66,6 @@ static const struct ttm_place place_vram = {
 static const struct ttm_place place_vram_top = {
 	.mem_type = TTM_PL_VRAM,
 	.flags = TTM_PL_FLAG_TOPDOWN,
-};
-
-static const struct ttm_place place_vram_pinned = {
-	.mem_type = TTM_PL_VRAM,
-	.flags = TTM_PL_FLAG_NO_EVICT,
 };
 
 static struct ttm_placement pl_sys = {
@@ -88,13 +87,6 @@ static struct ttm_placement pl_vram_top = {
 	.placement = &place_vram_top,
 	.num_busy_placement = 1,
 	.busy_placement = &place_vram_top,
-};
-
-static struct ttm_placement pl_vram_pinned = {
-	.num_placement = 1,
-	.placement = &place_vram_pinned,
-	.num_busy_placement = 1,
-	.busy_placement = &place_vram_pinned,
 };
 
 static const char *placement_name(struct ttm_placement *pl)
@@ -121,32 +113,22 @@ static const char *mem_name(u32 mem_type)
 static void dump_bo(const char *tag, struct demo_bo *dbo)
 {
 	struct ttm_buffer_object *bo = &dbo->tbo;
-	bool has_mem = bo->mem.mm_node != NULL;
-	u32 mem = has_mem ? bo->mem.mem_type : U32_MAX;
-	unsigned long start = has_mem ? bo->mem.start : 0;
+	u32 mem = bo->resource ? bo->resource->mem_type : U32_MAX;
+	unsigned long start = bo->resource ? bo->resource->start : 0;
 	bool pop = bo->ttm && ttm_tt_is_populated(bo->ttm);
 
-	pr_info("  %-8s %s size=%zuKB mem=%s start=%lu no_evict=%d tt=%s pop=%d\n",
+	pr_info("  %-8s %s size=%zuKB mem=%s start=%lu pin=%u tt=%s pop=%d\n",
 		tag, dbo->name, bo->base.size >> 10,
-		has_mem ? mem_name(mem) : "NONE", start,
-		has_mem && (bo->mem.placement & TTM_PL_FLAG_NO_EVICT),
-		bo->ttm ? "yes" : "no", pop);
+		bo->resource ? mem_name(mem) : "NONE", start,
+		bo->pin_count, bo->ttm ? "yes" : "no", pop);
 }
 
 static void dump_vram(const char *tag)
 {
-	struct ttm_resource_manager *man;
-	struct ttm_buffer_object *bo;
-	u64 usage = 0;
-	unsigned int prio;
-
-	man = ttm_manager_type(&demo_bdev, TTM_PL_VRAM);
-	for (prio = 0; prio < TTM_MAX_BO_PRIORITY; prio++)
-		list_for_each_entry(bo, &man->lru[prio], lru)
-			usage += bo->mem.size;
+	struct ttm_resource_manager *man = ttm_manager_type(&demo_bdev, TTM_PL_VRAM);
 
 	pr_info("  %-8s VRAM usage=%llu / %llu bytes\n",
-		tag, usage,
+		tag, ttm_resource_manager_usage(man),
 		(u64)DEMO_VRAM_PAGES << PAGE_SHIFT);
 }
 
@@ -161,7 +143,7 @@ static struct ttm_tt *demo_tt_create(struct ttm_buffer_object *bo, u32 page_flag
 	if (!tt)
 		return NULL;
 
-	err = ttm_tt_init(tt, bo, page_flags);
+	err = ttm_tt_init(tt, bo, page_flags, ttm_cached, 0);
 	if (err) {
 		kfree(tt);
 		return NULL;
@@ -169,7 +151,7 @@ static struct ttm_tt *demo_tt_create(struct ttm_buffer_object *bo, u32 page_flag
 	return tt;
 }
 
-static void demo_tt_destroy(struct ttm_bo_device *bdev, struct ttm_tt *tt)
+static void demo_tt_destroy(struct ttm_device *bdev, struct ttm_tt *tt)
 {
 	ttm_tt_fini(tt);
 	kfree(tt);
@@ -182,18 +164,19 @@ static void demo_tt_destroy(struct ttm_bo_device *bdev, struct ttm_tt *tt)
  */
 static int demo_move(struct ttm_buffer_object *bo, bool evict,
 		     struct ttm_operation_ctx *ctx,
-		     struct ttm_resource *new_mem)
+		     struct ttm_resource *new_mem,
+		     struct ttm_place *hop)
 {
 	struct demo_bo *dbo = container_of(bo, struct demo_bo, tbo);
-	const char *from = bo->mem.mm_node ? mem_name(bo->mem.mem_type) : "NONE";
+	const char *from = bo->resource ? mem_name(bo->resource->mem_type) : "NONE";
 	int err;
 
 	pr_info("  move %s %s -> %s evict=%d\n",
 		dbo->name, from, mem_name(new_mem->mem_type), evict);
 
-	err = ttm_bo_wait(bo, ctx->interruptible, ctx->no_wait_gpu);
+	err = ttm_bo_wait_ctx(bo, ctx);
 	if (err) {
-		pr_info("  wait err=%d（dma_resv 上还有未完成 fence）\n", err);
+		pr_info("  wait_ctx err=%d（dma_resv 上还有未完成 fence）\n", err);
 		return err;
 	}
 
@@ -208,7 +191,7 @@ static void demo_evict_flags(struct ttm_buffer_object *bo,
 	*placement = pl_sys;
 }
 
-static struct ttm_bo_driver demo_funcs = {
+static struct ttm_device_funcs demo_funcs = {
 	.ttm_tt_create       = demo_tt_create,
 	.ttm_tt_destroy      = demo_tt_destroy,
 	.move                = demo_move,
@@ -237,9 +220,8 @@ static struct demo_bo *demo_bo_create(const char *name, size_t size,
 	drm_gem_private_object_init(&demo_drm, &dbo->tbo.base, size);
 
 	/* 成功时 BO 仍处于 reserved；失败时内部已经 destroy/kfree */
-	err = ttm_bo_init_reserved(&demo_bdev, &dbo->tbo, size,
-				   ttm_bo_type_kernel, pl, 1, &ctx,
-				   size, NULL, NULL, demo_bo_destroy);
+	err = ttm_bo_init_reserved(&demo_bdev, &dbo->tbo, ttm_bo_type_kernel,
+				   pl, 1, &ctx, NULL, NULL, demo_bo_destroy);
 	if (err)
 		return ERR_PTR(err);
 
@@ -335,15 +317,20 @@ static int demo_attach_busy_fence(struct demo_bo *dbo, struct dma_fence *f)
 	int err;
 
 	dma_resv_lock(resv, NULL);
-	dma_resv_add_excl_fence(resv, f);
-	err = 0;
+	err = dma_resv_reserve_fences(resv, 1);
+	if (!err)
+		dma_resv_add_fence(resv, f, DMA_RESV_USAGE_KERNEL);
 	dma_resv_unlock(resv);
 	return err;
 }
 
-/* ---------- 最小 DRM 设备：不给 /dev/dri 注册 minor，避免占满 minor 号 ---------- */
+/*
+ * 最小 DRM 设备：不调用 drm_dev_alloc()，因此不向全局 DRM minor idr 申请编号。
+ * 多卡机器（例如 64 张 GPU）上 minor 可能已经耗尽，drm_dev_alloc 会返回 -ENOSPC。
+ * TTM 只需要 address_space + vma manager，不必注册 /dev/dri 节点。
+ */
 static const struct file_operations demo_anon_fops = {
-	.owner = THIS_MODULE,
+	.llseek = noop_llseek,
 };
 
 static struct drm_driver demo_drm_driver = {
@@ -369,12 +356,8 @@ static int demo_setup_device(void)
 	memset(&demo_vma_mgr, 0, sizeof(demo_vma_mgr));
 	demo_drm.dev = &demo_pdev->dev;
 	demo_drm.driver = &demo_drm_driver;
+	demo_drm.driver_features = DRIVER_GEM;
 
-	/*
-	 * 不用 drm_dev_alloc()：它会向全局 DRM minor idr 申请编号。
-	 * 本机已有 64 张 GPU card，minor 耗尽后会返回 -ENOSPC。
-	 * TTM 只需要 address_space + vma manager，不必注册 /dev/dri 节点。
-	 */
 	demo_anon_file = anon_inode_getfile("[ttm_demo]", &demo_anon_fops,
 					    NULL, O_RDWR | O_CLOEXEC);
 	if (IS_ERR(demo_anon_file)) {
@@ -391,18 +374,14 @@ static int demo_setup_device(void)
 				    DRM_FILE_PAGE_OFFSET_SIZE);
 	demo_drm_ok = true;
 
-	err = ttm_bo_device_init(&demo_bdev, &demo_funcs,
-				 demo_anon_file->f_inode->i_mapping,
-				 demo_drm.vma_offset_manager, false);
+	err = ttm_device_init(&demo_bdev, &demo_funcs, demo_drm.dev,
+			      demo_anon_file->f_inode->i_mapping,
+			      demo_drm.vma_offset_manager, false, false);
 	if (err)
 		goto err_drm;
 	demo_ttm_ok = true;
 
-	/*
-	 * use_tt=true：VRAM 域仍用 ttm_tt 系统页做 backing。
-	 * 真 amdgpu 的 VRAM 由 GTT/SDMA 搬运到 GPU 显存；这里只演示
-	 * placement / eviction / move 回调，不碰硬件 iomem。
-	 */
+	/* use_tt=true：假 VRAM 仍用系统页做 backing，避免真 iomem */
 	err = ttm_range_man_init(&demo_bdev, TTM_PL_VRAM, true, DEMO_VRAM_PAGES);
 	if (err)
 		goto err_ttm;
@@ -413,7 +392,7 @@ static int demo_setup_device(void)
 	return 0;
 
 err_ttm:
-	ttm_bo_device_release(&demo_bdev);
+	ttm_device_fini(&demo_bdev);
 	demo_ttm_ok = false;
 err_drm:
 	if (demo_drm_ok) {
@@ -441,7 +420,7 @@ static void demo_teardown_device(void)
 		demo_vram_ok = false;
 	}
 	if (demo_ttm_ok) {
-		ttm_bo_device_release(&demo_bdev);
+		ttm_device_fini(&demo_bdev);
 		demo_ttm_ok = false;
 	}
 	if (demo_drm_ok) {
@@ -545,28 +524,34 @@ static int demo_run(void)
 	pr_info("  eviction 后读 A[0]=0x%x（%s），说明 move_null 只换标签、页还在\n",
 		got, got == DEMO_MAGIC ? "magic 还在" : "数据丢了");
 
-	/* [5] pin 住 B 后，再挤 8KB：只能踢 C，不能踢 B */
+	/* [5] pin 住 B 后，再挤 8KB：只能踢 C，不能踢 B
+	 * 6.8 已删除 TTM_PL_FLAG_NO_EVICT，改用 ttm_bo_pin()。
+	 */
 	pr_info("[5] pin B，再创建 D (8KB)：应 eviction C，B 留在 VRAM\n");
 	err = ttm_bo_reserve(&b->tbo, false, false, NULL);
 	if (err)
 		goto out;
+	ttm_bo_pin(&b->tbo);
 	ttm_bo_unreserve(&b->tbo);
-
-	err = demo_bo_validate(b, &pl_vram_pinned, true);
-	if (err)
-		goto out;
 
 	d = demo_bo_create("D", PAGE_SIZE * 2, &pl_vram);
 	if (IS_ERR(d)) {
 		err = PTR_ERR(d);
 		d = NULL;
-		goto out;
+		goto out_unpin;
 	}
 	dump_bo("pinned", b);
 	dump_bo("evicted", c);
 	dump_bo("new", d);
 	dump_vram("after-D");
 	err = 0;
+
+out_unpin:
+	if (!ttm_bo_reserve(&b->tbo, false, false, NULL)) {
+		if (b->tbo.pin_count)
+			ttm_bo_unpin(&b->tbo);
+		ttm_bo_unreserve(&b->tbo);
+	}
 
 out:
 	demo_bo_put(d);
@@ -591,16 +576,13 @@ static int __init ttm_demo_init(void)
 		return err;
 
 	err = demo_run();
-	if (err) {
-		demo_teardown_device();
-		return err;
-	}
-	return 0;
+	/* 跑完立刻拆设备，避免 anon_inode file 把模块钉在 in-use */
+	demo_teardown_device();
+	return err;
 }
 
 static void __exit ttm_demo_exit(void)
 {
-	demo_teardown_device();
 	pr_info("=== TTM demo unloaded ===\n");
 }
 

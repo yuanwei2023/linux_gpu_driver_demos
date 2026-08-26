@@ -11,7 +11,7 @@
 │    size, dma_resv, handle — 用户态看到的“buffer 对象”      │
 ├─────────────────────────────────────────────────────────────┤
 │  TTM (ttm_buffer_object)                                  │
-│    mem (placement) — 这块 buffer 放在哪个域、偏移多少       │
+│    resource (placement) — 这块 buffer 放在哪个域、偏移多少  │
 │    ttm_tt            — 系统 RAM 页 backing（真正存数据）     │
 ├─────────────────────────────────────────────────────────────┤
 │  Resource Manager                                           │
@@ -26,7 +26,7 @@
 | 域 | 本 demo | 真实 amdgpu |
 |---|---|---|
 | **SYSTEM** | 只记账；数据在 `ttm_tt` 系统页 | 同上，或 swap 到 shmem |
-| **VRAM** | 只改 `mem.mem_type` 标签；数据仍在系统页 | SDMA 把页搬到 GPU 显存 |
+| **VRAM** | 只改 `resource->mem_type` 标签；数据仍在系统页 | SDMA 把页搬到 GPU 显存 |
 | **backing** | `ttm_tt->pages[]` 始终是系统 RAM | VRAM 域也有 `ttm_tt` 做中转 |
 
 关键：**placement（放哪）和 backing（数据在哪）是分开的**。  
@@ -43,7 +43,7 @@ drm_gem_private_object_init()   ← 设置 size、挂 dma_resv
         ▼
 ttm_bo_init_reserved()          ← 立刻 validate 到目标 placement
         │
-        ├─ resource manager 分配 mem.start / mem.mem_type
+        ├─ resource manager 分配 resource->start / mem_type
         ├─ funcs->move()     域切换（等 fence → 搬数据或换标签）
         └─ ttm_tt_populate() CPU 访问时填充系统页
 ```
@@ -76,7 +76,7 @@ destroy: ttm_bo_put()
 [4] C=8KB @ VRAM  →  eviction A→SYSTEM，magic 仍在
       布局: [ B 8KB ][ C 8KB ]
 
-[5] B 设 NO_EVICT → 创建 D=8KB → 只能踢 C
+[5] pin B → 创建 D=8KB → 只能踢 C
       布局: [ B 8KB ][ D 8KB ]
 ```
 
@@ -84,11 +84,11 @@ destroy: ttm_bo_put()
 
 | 本 demo | amdgpu (`amdgpu_ttm.c`) |
 |---|---|
-| `ttm_bo_device_init` | `ttm_bo_device_init(&adev->mman.bdev, ...)` |
+| `ttm_device_init` | `ttm_device_init(&adev->mman.bdev, ...)` |
 | `ttm_range_man_init(VRAM)` | VRAM/GDS/doorbell manager |
-| `move` = wait + `move_null` | `amdgpu_bo_move` = wait + SDMA |
+| `move` = `wait_ctx` + `move_null` | `amdgpu_bo_move` = wait + SDMA |
 | `evict_flags` → SYSTEM | `amdgpu_evict_flags` → GTT → SYSTEM |
-| `TTM_PL_FLAG_NO_EVICT` | pin / 内核 BO 防 eviction |
+| `ttm_bo_pin` | pin / 内核 BO 防 eviction |
 | `bo->base.resv` | CS / move / CPU 共用同一张 fence 表 |
 
 TTM 管 **placement**；GPU 虚拟地址（GPUVM）是更上层，本 demo 不涉及。
@@ -101,7 +101,9 @@ TTM 管 **placement**；GPU 虚拟地址（GPUVM）是更上层，本 demo 不�
 
 ## 编译与运行
 
-内核 5.10+（本机 `5.10.134` 已验证）：
+内核 6.8（本机 `6.8.0-116-generic`）。旧头 `ttm_bo_api.h` / `ttm_bo_driver.h` 已经合并进 `ttm_bo.h` / `ttm_device.h`。
+
+多卡机器上 `drm_dev_alloc()` 可能因 DRM minor 耗尽返回 `-ENOSPC`，本 demo 改用 `anon_inode` + 手工 `vma_offset_manager`，不注册 `/dev/dri`。
 
 ```bash
 cd linux_gpu_driver_demos/ttm_demo
@@ -118,9 +120,10 @@ dmesg | rg ttm_demo
 ## 建议配合阅读的内核头文件
 
 ```text
-include/drm/ttm/ttm_bo_api.h      — BO 生命周期 API
-include/drm/ttm/ttm_bo_driver.h   — driver 回调、ttm_bo_device
-include/drm/ttm/ttm_placement.h   — TTM_PL_* 域定义
-include/drm/ttm/ttm_tt.h          — 系统页 backing
-include/drm/drm_gem.h             — GEM 对象
+include/drm/ttm/ttm_bo.h            — BO 生命周期 API
+include/drm/ttm/ttm_device.h        — driver 回调、ttm_device
+include/drm/ttm/ttm_placement.h     — TTM_PL_* 域定义
+include/drm/ttm/ttm_range_manager.h — 有限域区间分配
+include/drm/ttm/ttm_tt.h            — 系统页 backing
+include/drm/drm_gem.h               — GEM 对象
 ```
