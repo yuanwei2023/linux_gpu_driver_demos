@@ -10,7 +10,7 @@ clean:
 	$(MAKE) -C $(KDIR) M=$(PWD) clean
 
 run: all
-	-sudo rmmod ttm_demo 2>/dev/null
+	@sudo rmmod ttm_demo 2>/dev/null || true
 	@if lsmod | grep -q '^ttm_demo '; then \
 		echo "ttm_demo is still loaded (old instance pinned). Reboot once, then retry."; \
 		exit 1; \
